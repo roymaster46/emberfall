@@ -1,14 +1,14 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward
-// from a fresh world for a fixed number of steps, steered by a simple autopilot (kite away
-// from the nearest enemy and bullet, chase the nearest spark, shoot the nearest foe), so the
-// frame is what a short game really looks like and the same seed always gives the same frame.
+// The screenshot scenes behind ?shot=start|play|upgrade|win. Each one plays the real rules
+// forward from a fresh world for a fixed number of steps, steered by a simple autopilot
+// (kite away from the nearest enemy and bullet, chase the nearest spark, shoot the nearest
+// foe — bosses first), so the frame is what a short game really looks like and the same
+// seed always gives the same frame. The autopilot picks the first draft ember, so a long
+// run keeps playing through its upgrades the way a player would.
 import { FIELD, STEP } from './config.js';
-import { createWorld, stepWorld } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createWorld, pickUpgrade, stepWorld } from './world.js';
+import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN } from './render.js';
 
 const START_SECONDS = 6;
-const PLAY_SECONDS = 16;
-const END_LIMIT_SECONDS = 600;
 const SAMPLE = STEP;
 
 /** A scripted stand-in for the live input: the autopilot sets move, aim and fire each step. */
@@ -42,27 +42,30 @@ function scriptedInput() {
 
 /**
  * Steer the wisp: flee the closest threat, drift toward the closest spark, keep inside the
- * arena, and shoot the nearest enemy. `skill` 1 plays to survive; 0.35 plays carelessly, so
- * the end scene is caught out once the waves speed up.
+ * arena, and shoot the nearest enemy — a boss or the King first, since they are the fight.
+ * `skill` 1 plays to survive; 0.35 plays carelessly, so the end scene is caught out once
+ * the waves speed up.
  */
 function autopilot(world, input, skill) {
   const player = world.player;
   const s = input.state;
   let mx = 0;
   let my = 0;
-  let nearest = null;
-  let nearestD = Infinity;
+  let target = null;
+  let targetD = Infinity;
   for (const e of world.enemies) {
     const d = Math.hypot(e.x - player.x, e.y - player.y);
-    if (d < nearestD) {
-      nearestD = d;
-      nearest = e;
+    const priority = e.kind === 'king' || e.kind === 'boss' ? d * 0.25 : d;
+    if (priority < targetD) {
+      targetD = priority;
+      target = e;
     }
   }
-  if (nearest && nearestD < 260 * skill + 60) {
+  const nearestD = target ? Math.hypot(target.x - player.x, target.y - player.y) : Infinity;
+  if (target && nearestD < 260 * skill + 60) {
     const w = (260 - Math.min(260, nearestD)) / 260;
-    mx += ((player.x - nearest.x) / (nearestD || 1)) * w * 2;
-    my += ((player.y - nearest.y) / (nearestD || 1)) * w * 2;
+    mx += ((player.x - target.x) / (nearestD || 1)) * w * 2;
+    my += ((player.y - target.y) / (nearestD || 1)) * w * 2;
   }
   for (const b of world.bullets) {
     if (b.friendly) continue;
@@ -104,14 +107,21 @@ function autopilot(world, input, skill) {
     s.ax = 0;
     s.ay = 0;
   }
-  if (nearest) {
-    s.mouseX = nearest.x;
-    s.mouseY = nearest.y;
+  if (target) {
+    s.mouseX = target.x;
+    s.mouseY = target.y;
     s.fire = skill > 0.5 || nearestD < 320;
   } else {
     s.fire = false;
   }
-  s.dash = nearest !== null && nearestD < 90 && player.dashCooldown <= 0;
+  s.dash = target !== null && nearestD < 90 && player.dashCooldown <= 0;
+}
+
+// Step the world forward; whenever a draft opens, take the first ember and keep playing.
+function stepWithDrafts(world, input, skill) {
+  autopilot(world, input, skill);
+  stepWorld(world, input, SAMPLE);
+  if (world.draftOpen) pickUpgrade(world, 0);
 }
 
 function simulate(seconds, skill, seed) {
@@ -120,9 +130,29 @@ function simulate(seconds, skill, seed) {
   const input = scriptedInput();
   const steps = Math.floor(seconds / SAMPLE);
   for (let i = 0; i < steps; i += 1) {
-    if (world.over) break;
+    if (world.over || world.won) break;
+    stepWithDrafts(world, input, skill);
+  }
+  return world;
+}
+
+// Play until `stop` says the frame is busy enough, or the cap runs out. When `autoPick`
+// is false the draft stays open when it appears, so the upgrade scene can show it.
+function simulateUntil(stop, skill, seed, capSeconds, autoPick = true) {
+  const world = createWorld(seed);
+  world.best = 2480;
+  const input = scriptedInput();
+  const steps = Math.floor(capSeconds / SAMPLE);
+  for (let i = 0; i < steps; i += 1) {
+    if (world.over || world.won) break;
     autopilot(world, input, skill);
     stepWorld(world, input, SAMPLE);
+    if (world.draftOpen) {
+      if (stop(world)) break;
+      if (autoPick) pickUpgrade(world, 0);
+      else break;
+    }
+    if (stop(world)) break;
   }
   return world;
 }
@@ -131,11 +161,10 @@ function simulateUntilOver(seed) {
   const world = createWorld(seed);
   world.best = 2480;
   const input = scriptedInput();
-  const steps = Math.floor(END_LIMIT_SECONDS / SAMPLE);
+  const steps = Math.floor(600 / SAMPLE);
   for (let i = 0; i < steps; i += 1) {
     if (world.over) break;
-    autopilot(world, input, 0.3);
-    stepWorld(world, input, SAMPLE);
+    stepWithDrafts(world, input, 0.3);
   }
   return world;
 }
@@ -143,8 +172,25 @@ function simulateUntilOver(seed) {
 /** Build the world for one screenshot scene; `time` is the clock render.js draws with. */
 export function sceneForShot(shot, seed) {
   if (shot === 'play') {
-    const world = simulate(PLAY_SECONDS, 1, seed);
-    return { world, screen: SCREEN_PLAY, time: PLAY_SECONDS };
+    // A busy mid-game frame: a boss fight, the arena crowded around it. The boss
+    // lives long enough (and summons) that the frame stays full while it is out.
+    const world = simulateUntil(
+      (w) => w.enemies.some((e) => e.kind === 'boss' || e.kind === 'king') && w.enemies.length >= 3,
+      1,
+      seed,
+      200,
+    );
+    return { world, screen: SCREEN_PLAY, time: world.time };
+  }
+  if (shot === 'upgrade') {
+    // The first draft: wave 1 cleared, three embers on the table, none picked yet.
+    const world = simulateUntil((w) => w.draftOpen, 1, seed, 120, false);
+    return { world, screen: SCREEN_UPGRADE, time: world.time };
+  }
+  if (shot === 'win') {
+    // The whole run: ten waves, the Ember King falls, the dawn breaks.
+    const world = simulateUntil((w) => w.won, 1, seed, 600);
+    return { world, screen: world.won ? SCREEN_WIN : SCREEN_OVER, time: world.time };
   }
   if (shot === 'end') {
     const world = simulateUntilOver(seed);

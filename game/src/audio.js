@@ -1,6 +1,8 @@
 // All sound is synthesized with WebAudio: no audio files, no network, nothing to load.
 // A tiny synth builds blips, noise bursts and a slow arpeggio loop. Audio starts only after
 // the player's first gesture (the browser's autoplay rule), and M mutes everything.
+// The music follows the fight: setIntensity(1) on boss waves and late waves plays the
+// arpeggio faster with an extra high harmony, then it settles back down.
 export function createAudio() {
   let ctx = null;
   let master = null;
@@ -8,10 +10,12 @@ export function createAudio() {
   let muted = false;
   let musicTimer = null;
   let musicStep = 0;
+  let intensity = 0;
 
   // A minor arpeggio that drifts under the game; the bass note changes each wave.
   const MELODY = [220, 261.63, 329.63, 392, 329.63, 261.63, 196, 261.63];
   const BASS = [55, 55, 65.41, 49, 55, 65.41, 73.42, 49];
+  const HARMONY = [440, 523.25, 659.25, 784, 659.25, 523.25, 392, 523.25];
 
   function ensure() {
     if (ctx) return true;
@@ -68,40 +72,61 @@ export function createAudio() {
     src.start(t0);
   }
 
+  function musicBeat() {
+    if (!ctx) return;
+    const step = musicStep % 8;
+    const note = MELODY[step];
+    const bass = BASS[step];
+    const t0 = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(note, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.5, t0 + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.55);
+    osc.connect(gain);
+    gain.connect(musicGain);
+    osc.start(t0);
+    osc.stop(t0 + 0.6);
+    // Hot intensity adds a high harmony over the arpeggio.
+    if (intensity > 0) {
+      const h = ctx.createOscillator();
+      const hg = ctx.createGain();
+      h.type = 'sine';
+      h.frequency.setValueAtTime(HARMONY[step], t0);
+      hg.gain.setValueAtTime(0.0001, t0);
+      hg.gain.exponentialRampToValueAtTime(0.3, t0 + 0.03);
+      hg.gain.exponentialRampToValueAtTime(0.001, t0 + 0.5);
+      h.connect(hg);
+      hg.connect(musicGain);
+      h.start(t0);
+      h.stop(t0 + 0.55);
+    }
+    if (step === 0) {
+      const b = ctx.createOscillator();
+      const bg = ctx.createGain();
+      b.type = 'triangle';
+      b.frequency.setValueAtTime(bass, t0);
+      bg.gain.setValueAtTime(0.0001, t0);
+      bg.gain.exponentialRampToValueAtTime(0.6, t0 + 0.05);
+      bg.gain.exponentialRampToValueAtTime(0.001, t0 + 1.8);
+      b.connect(bg);
+      bg.connect(musicGain);
+      b.start(t0);
+      b.stop(t0 + 1.9);
+    }
+    musicStep += 1;
+  }
+
   function startMusic() {
     if (!ctx || musicTimer !== null) return;
-    musicTimer = setInterval(() => {
+    const tick = () => {
       if (muted || !ctx) return;
-      const step = musicStep % 8;
-      const note = MELODY[step];
-      const bass = BASS[step];
-      const t0 = ctx.currentTime;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(note, t0);
-      gain.gain.setValueAtTime(0.0001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.5, t0 + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.55);
-      osc.connect(gain);
-      gain.connect(musicGain);
-      osc.start(t0);
-      osc.stop(t0 + 0.6);
-      if (step === 0) {
-        const b = ctx.createOscillator();
-        const bg = ctx.createGain();
-        b.type = 'triangle';
-        b.frequency.setValueAtTime(bass, t0);
-        bg.gain.setValueAtTime(0.0001, t0);
-        bg.gain.exponentialRampToValueAtTime(0.6, t0 + 0.05);
-        bg.gain.exponentialRampToValueAtTime(0.001, t0 + 1.8);
-        b.connect(bg);
-        bg.connect(musicGain);
-        b.start(t0);
-        b.stop(t0 + 1.9);
-      }
-      musicStep += 1;
-    }, 340);
+      musicBeat();
+      musicTimer = setTimeout(tick, intensity > 0 ? 260 : 340);
+    };
+    musicTimer = setTimeout(tick, 340);
   }
 
   return {
@@ -118,6 +143,11 @@ export function createAudio() {
     },
     isMuted() {
       return muted;
+    },
+    // 0 is the calm arpeggio, 1 is the hotter boss-wave drive. Switching takes effect
+    // on the next beat; the loop re-times itself.
+    setIntensity(next) {
+      intensity = next ? 1 : 0;
     },
     shoot() {
       tone(720, 0.07, 'square', 0.08, 0, 340);
@@ -159,6 +189,21 @@ export function createAudio() {
     boss() {
       tone(98, 0.5, 'sawtooth', 0.18, 0, 49);
       tone(147, 0.5, 'sawtooth', 0.12, 0.15, 73);
+    },
+    draft() {
+      tone(523, 0.15, 'triangle', 0.12);
+      tone(784, 0.2, 'triangle', 0.12, 0.1);
+    },
+    upgrade() {
+      [523, 659, 784, 1046, 1318].forEach((f, i) => tone(f, 0.16, 'triangle', 0.13, i * 0.06));
+    },
+    streak() {
+      tone(1046, 0.12, 'square', 0.1);
+      tone(1568, 0.18, 'square', 0.1, 0.08);
+    },
+    victory() {
+      [523, 659, 784, 1046, 784, 1046, 1318].forEach((f, i) => tone(f, 0.3, 'triangle', 0.14, i * 0.14));
+      noise(0.8, 0.08, 3000);
     },
     gameOver() {
       [392, 329.63, 261.63, 196].forEach((f, i) => tone(f, 0.35, 'triangle', 0.14, i * 0.22));

@@ -1,11 +1,15 @@
 // Emberfall's entry point: the loop, the state machine and the wiring between input, world,
-// audio and render. In shot mode (?shot=start|play|end&seed=N) it renders one deterministic
-// scene and sets window.__shotReady so the screenshot script knows the frame is done.
+// audio and render. In shot mode (?shot=start|play|upgrade|win&seed=N) it renders one
+// deterministic scene and sets window.__shotReady so the screenshot script knows the frame
+// is done.
+//
+// Screens: title → play → upgrade (after each cleared wave, pick one ember) → … → win
+// (the Ember King falls on wave 10) or over (the flame dies). Pause sits over play.
 import { FIELD, STEP } from './config.js';
 import { createAudio } from './audio.js';
 import { createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSE, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { createWorld, stepWorld } from './world.js';
+import { cardAt, createRenderer, SCREEN_OVER, SCREEN_PAUSE, SCREEN_PLAY, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN } from './render.js';
+import { createWorld, pickUpgrade, stepWorld } from './world.js';
 import { sceneForShot } from './shots.js';
 
 const BEST_KEY = 'emberfall-best';
@@ -73,6 +77,10 @@ if (shot) {
       else if (event === 9) audio.wave();
       else if (event === 10) audio.boss();
       else if (event === 11) audio.gameOver();
+      else if (event === 12) audio.draft();
+      else if (event === 13) audio.upgrade();
+      else if (event === 14) audio.victory();
+      else if (event === 15) audio.streak();
     }
   }
 
@@ -80,7 +88,7 @@ if (shot) {
     if (event.code === 'Enter' && screen === SCREEN_TITLE) {
       audio.unlock();
       newGame();
-    } else if (event.code === 'KeyR' && (screen === SCREEN_OVER || screen === SCREEN_PLAY)) {
+    } else if (event.code === 'KeyR' && (screen === SCREEN_OVER || screen === SCREEN_WIN || screen === SCREEN_PLAY)) {
       audio.unlock();
       newGame();
     } else if (event.code === 'KeyP' && (screen === SCREEN_PLAY || screen === SCREEN_PAUSE)) {
@@ -90,6 +98,13 @@ if (shot) {
     } else if (event.code === 'KeyM') {
       muted = audio.toggleMute();
       void muted;
+    } else if (screen === SCREEN_UPGRADE) {
+      // Pick an ember with 1, 2 or 3.
+      const pick = event.code === 'Digit1' ? 0 : event.code === 'Digit2' ? 1 : event.code === 'Digit3' ? 2 : -1;
+      if (pick >= 0 && pickUpgrade(world, pick)) {
+        audio.upgrade();
+        screen = SCREEN_PLAY;
+      }
     }
   }
   window.addEventListener('keydown', keydown);
@@ -111,11 +126,19 @@ if (shot) {
     if (screen === SCREEN_TITLE && input.consumeClick()) {
       audio.unlock();
       newGame();
-    } else if (screen === SCREEN_OVER && input.consumeClick()) {
+    } else if ((screen === SCREEN_OVER || screen === SCREEN_WIN) && input.consumeClick()) {
       audio.unlock();
       newGame();
     } else if (screen === SCREEN_PAUSE && input.consumeClick()) {
       togglePause();
+    } else if (screen === SCREEN_UPGRADE && input.consumeClick()) {
+      // Click a draft card to pick that ember.
+      const m = input.mouse();
+      const pick = cardAt(m.x, m.y);
+      if (pick >= 0 && pickUpgrade(world, pick)) {
+        audio.upgrade();
+        screen = SCREEN_PLAY;
+      }
     }
 
     if (screen === SCREEN_PLAY) {
@@ -124,6 +147,17 @@ if (shot) {
         acc -= STEP;
         const events = stepWorld(world, input, STEP);
         handleEvents(events);
+        // The music follows the fight: boss waves and late waves play hotter.
+        audio.setIntensity(world.enemies.some((e) => e.kind === 'boss' || e.kind === 'king') || world.wave >= 7 ? 1 : 0);
+        if (world.draftOpen) {
+          screen = SCREEN_UPGRADE;
+          break;
+        }
+        if (world.won) {
+          screen = SCREEN_WIN;
+          saveBest(Math.max(world.best, world.score));
+          break;
+        }
         if (world.over) {
           screen = SCREEN_OVER;
           saveBest(Math.max(world.best, world.score));

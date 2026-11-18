@@ -23,6 +23,15 @@ export function makePlayer() {
     spreadTimer: 0,
     shield: false,
     trail: 0,
+    // Upgrade stats: the wave-clear draft raises these for the rest of the run.
+    fireRate: 1,
+    damage: 1,
+    pierce: 0,
+    speedMult: 1,
+    magnetMult: 1,
+    dashCdMult: 1,
+    aegis: false,
+    muzzle: 0, // seconds of muzzle flash left to draw
     dead: false,
   };
 }
@@ -45,10 +54,23 @@ export function makeEnemy(kind, x, y, rng) {
     chargeTimer: 0,
     chargeDirX: 0,
     chargeDirY: 0,
+    zigPhase: range(rng, 0, Math.PI * 2),
     flash: 0,
     wobble: range(rng, 0, Math.PI * 2),
+    elite: false,
     dead: false,
   };
+  return enemy;
+}
+
+// An embered elite: double health, a little bigger and faster, double score, gold tint.
+// Rolled at spawn time by world.js for waves at or past WAVE.eliteFrom.
+export function makeElite(enemy) {
+  enemy.elite = true;
+  enemy.health = enemy.maxHealth * 2;
+  enemy.maxHealth = enemy.health;
+  enemy.radius = Math.round(enemy.radius * 1.15);
+  enemy.speed *= 1.1;
   return enemy;
 }
 
@@ -62,7 +84,7 @@ export function edgeSpawn(rng) {
   return { x: -m, y: range(rng, 0, FIELD.height) };
 }
 
-export function makeBullet(x, y, vx, vy, friendly) {
+export function makeBullet(x, y, vx, vy, friendly, damage = 1, pierce = 0) {
   return {
     kind: 'bullet',
     x,
@@ -71,6 +93,8 @@ export function makeBullet(x, y, vx, vy, friendly) {
     vy,
     radius: friendly ? PLAYER.bulletRadius : 7,
     friendly,
+    damage,
+    pierce,
     life: 2.2,
     dead: false,
   };
@@ -94,8 +118,8 @@ export function makeParticle(x, y, vx, vy, life, size, color) {
   return { x, y, vx, vy, life, maxLife: life, size, color, dead: false };
 }
 
-export function makeFloatText(x, y, text, color) {
-  return { x, y, text, color, life: 0.9, maxLife: 0.9, dead: false };
+export function makeFloatText(x, y, text, color, small = false) {
+  return { x, y, text, color, life: small ? 0.55 : 0.9, maxLife: small ? 0.55 : 0.9, small, dead: false };
 }
 
 export function burst(particles, x, y, count, color, speed, life) {

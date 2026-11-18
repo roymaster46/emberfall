@@ -1,9 +1,14 @@
 // The rules of Emberfall: waves, spawning, movement, collisions, scoring and the combo.
 // world.js owns the state and steps it forward; it knows nothing about drawing or sound,
 // it only reports events (kills, pickups, damage) for main.js to turn into sound and shake.
-import { COLORS, COMBO_MAX, COMBO_WINDOW, ENEMY, FIELD, PICKUP, PLAYER, SCORE, STEP, WAVE } from './config.js';
-import { burst, edgeSpawn, makeBullet, makeEnemy, makeFloatText, makePickup, makePlayer } from './entities.js';
+//
+// The loop: survive a wave, then the arena offers a draft — pick one ember (an upgrade)
+// from three — then the next wave. Wave 10 holds the Ember King; kill him and the dawn
+// breaks (world.won), which is the game's win. After that the run can end in victory.
+import { COLORS, COMBO_MAX, COMBO_WINDOW, ENEMY, FIELD, FINAL_WAVE, PICKUP, PLAYER, SCORE, STEP, STREAK_CALLS, STREAK_WINDOW, WAVE } from './config.js';
+import { burst, edgeSpawn, makeBullet, makeElite, makeEnemy, makeFloatText, makePickup, makePlayer } from './entities.js';
 import { mulberry32, pick, range } from './random.js';
+import { applyUpgrade, rollUpgrades } from './upgrades.js';
 
 export const EVENT_NONE = 0;
 export const EVENT_SHOOT = 1;
@@ -17,6 +22,10 @@ export const EVENT_DASH = 8;
 export const EVENT_WAVE = 9;
 export const EVENT_BOSS = 10;
 export const EVENT_OVER = 11;
+export const EVENT_DRAFT = 12;
+export const EVENT_UPGRADE = 13;
+export const EVENT_WIN = 14;
+export const EVENT_STREAK = 15;
 
 export function createWorld(seed) {
   const rng = mulberry32(seed);
@@ -34,6 +43,8 @@ export function createWorld(seed) {
     breather: 1.2,
     banner: '',
     bannerTimer: 0,
+    streakText: '',
+    streakTimer: 0,
     score: 0,
     best: 0,
     kills: 0,
@@ -41,10 +52,17 @@ export function createWorld(seed) {
     shotsHit: 0,
     combo: 0,
     comboTimer: 0,
+    streak: 0,
+    streakClock: 0,
+    draft: null, // three upgrade ids, while the draft screen is open
+    draftOpen: false,
+    draftedWave: 0, // the wave whose clear already offered a draft
+    owned: [], // upgrade ids picked this run
     time: 0,
     shake: 0,
     hitStop: 0,
     over: false,
+    won: false,
     events: [],
   };
 }
@@ -62,11 +80,14 @@ function startWave(world) {
   for (let i = 0; i < count; i += 1) {
     let kind = 'cinder';
     const roll = world.rng();
-    if (world.wave >= 3 && roll < 0.25) kind = 'spitter';
-    else if (world.wave >= 2 && roll < 0.45) kind = 'brute';
+    if (world.wave >= 4 && roll < 0.16) kind = 'sniper';
+    else if (world.wave >= 3 && roll < 0.36) kind = 'dart';
+    else if (world.wave >= 3 && roll < 0.55) kind = 'spitter';
+    else if (world.wave >= 2 && roll < 0.72) kind = 'brute';
     queue.push(kind);
   }
-  if (world.wave % WAVE.bossEvery === 0) queue.push('boss');
+  if (world.wave % WAVE.bossEvery === 0 && world.wave !== FINAL_WAVE) queue.push('boss');
+  if (world.wave === FINAL_WAVE) queue.push('king');
   // Shuffle so the mix walks in from all sides.
   for (let i = queue.length - 1; i > 0; i -= 1) {
     const j = Math.floor(world.rng() * (i + 1));
@@ -74,13 +95,42 @@ function startWave(world) {
   }
   world.spawnQueue = queue;
   world.spawnTimer = 0.4;
-  world.banner = world.wave % WAVE.bossEvery === 0 ? `WAVE ${world.wave} — THE CINDERLORD` : `WAVE ${world.wave}`;
+  if (world.wave === FINAL_WAVE) {
+    world.banner = `WAVE ${world.wave} — THE EMBER KING`;
+    world.events.push(EVENT_BOSS);
+  } else if (world.wave % WAVE.bossEvery === 0) {
+    world.banner = `WAVE ${world.wave} — THE CINDERLORD`;
+    world.events.push(EVENT_BOSS);
+  } else {
+    world.banner = `WAVE ${world.wave}`;
+    world.events.push(EVENT_WAVE);
+  }
   world.bannerTimer = 2.2;
-  world.events.push(world.wave % WAVE.bossEvery === 0 ? EVENT_BOSS : EVENT_WAVE);
+  // Aegis: every wave starts behind a shield.
+  if (world.player.aegis) world.player.shield = true;
+}
+
+// Open the wave-clear draft: three embers to choose from. The world waits (main.js shows
+// the draft screen) until pickUpgrade is called.
+export function openDraft(world) {
+  world.draft = rollUpgrades(world.rng, world.player, world.owned);
+  world.draftOpen = true;
+  world.events.push(EVENT_DRAFT);
+}
+
+export function pickUpgrade(world, index) {
+  if (!world.draftOpen || !world.draft || index < 0 || index >= world.draft.length) return false;
+  const id = world.draft[index];
+  applyUpgrade(world.player, id, world.owned);
+  world.draft = null;
+  world.draftOpen = false;
+  world.breather = WAVE.breather;
+  world.events.push(EVENT_UPGRADE);
+  return true;
 }
 
 function dropLoot(world, enemy) {
-  const sparks = enemy.kind === 'boss' ? 12 : enemy.kind === 'brute' ? 4 : enemy.kind === 'spitter' ? 2 : 1;
+  const sparks = enemy.kind === 'king' ? 20 : enemy.kind === 'boss' ? 12 : enemy.kind === 'brute' ? 4 : enemy.kind === 'spitter' ? 2 : 1;
   for (let i = 0; i < sparks; i += 1) {
     const p = makePickup('spark', enemy.x + range(world.rng, -18, 18), enemy.y + range(world.rng, -18, 18));
     p.vx = range(world.rng, -60, 60);
@@ -100,21 +150,53 @@ function dropLoot(world, enemy) {
   }
 }
 
+function enemyColor(kind) {
+  if (kind === 'boss') return COLORS.boss;
+  if (kind === 'king') return COLORS.king;
+  if (kind === 'brute') return COLORS.brute;
+  if (kind === 'spitter') return COLORS.spitter;
+  if (kind === 'dart') return COLORS.dart;
+  if (kind === 'sniper') return COLORS.sniper;
+  return COLORS.cinder;
+}
+
 function killEnemy(world, enemy, awardScore) {
   enemy.dead = true;
   world.kills += 1;
-  const color = enemy.kind === 'boss' ? COLORS.boss : enemy.kind === 'brute' ? COLORS.brute : enemy.kind === 'spitter' ? COLORS.spitter : COLORS.cinder;
-  burst(world.particles, enemy.x, enemy.y, enemy.kind === 'boss' ? 60 : enemy.kind === 'brute' ? 26 : 14, color, 260, 0.7);
+  const color = enemyColor(enemy.kind);
+  const big = enemy.kind === 'boss' || enemy.kind === 'king';
+  burst(world.particles, enemy.x, enemy.y, big ? 60 : enemy.kind === 'brute' ? 26 : 14, color, 260, 0.7);
   burst(world.particles, enemy.x, enemy.y, 8, COLORS.spark, 160, 0.5);
-  world.shake = Math.max(world.shake, enemy.kind === 'boss' ? 14 : enemy.kind === 'brute' ? 8 : 4);
-  world.hitStop = Math.max(world.hitStop, enemy.kind === 'boss' ? 0.12 : 0.045);
+  world.shake = Math.max(world.shake, big ? 14 : enemy.kind === 'brute' ? 8 : 4);
+  world.hitStop = Math.max(world.hitStop, big ? 0.12 : 0.045);
   if (awardScore) {
     const mult = Math.max(1, world.combo);
-    const pts = ENEMY[enemy.kind].score * mult;
+    const pts = ENEMY[enemy.kind].score * (enemy.elite ? 2 : 1) * mult;
     world.score += pts;
     world.texts.push(makeFloatText(enemy.x, enemy.y - enemy.radius - 6, `+${pts}`, mult > 1 ? COLORS.spark : COLORS.text));
   }
+  // Kill streaks: rapid kills chain up and call out milestones with bonus points.
+  world.streak += 1;
+  world.streakClock = STREAK_WINDOW;
+  for (const call of STREAK_CALLS) {
+    if (world.streak === call.at) {
+      world.streakText = call.text;
+      world.streakTimer = 1.6;
+      world.score += call.bonus;
+      world.texts.push(makeFloatText(world.player.x, world.player.y - 30, `+${call.bonus}`, COLORS.spark));
+      world.events.push(EVENT_STREAK);
+      break;
+    }
+  }
   dropLoot(world, enemy);
+  if (enemy.kind === 'king') {
+    // The Ember King falls: the run is won.
+    world.won = true;
+    burst(world.particles, enemy.x, enemy.y, 90, COLORS.king, 380, 1.4);
+    burst(world.particles, enemy.x, enemy.y, 40, COLORS.spark, 260, 1.1);
+    world.events.push(EVENT_WIN);
+    return;
+  }
   world.events.push(enemy.kind === 'boss' ? EVENT_BOSS_KILL : EVENT_KILL);
 }
 
@@ -132,6 +214,8 @@ function hurtPlayer(world) {
   player.invuln = PLAYER.invulnTime;
   world.combo = 0;
   world.comboTimer = 0;
+  world.streak = 0;
+  world.streakClock = 0;
   world.shake = Math.max(world.shake, 10);
   world.hitStop = Math.max(world.hitStop, 0.09);
   burst(world.particles, player.x, player.y, 22, COLORS.danger, 280, 0.7);
@@ -153,6 +237,7 @@ function stepPlayer(world, input, dt) {
   player.invuln = Math.max(0, player.invuln - dt);
   player.dashCooldown = Math.max(0, player.dashCooldown - dt);
   player.spreadTimer = Math.max(0, player.spreadTimer - dt);
+  player.muzzle = Math.max(0, player.muzzle - dt);
   player.fireTimer -= dt;
 
   // Aim at the mouse; with no mouse yet, face the nearest enemy.
@@ -182,7 +267,7 @@ function stepPlayer(world, input, dt) {
     player.dashDirX = dx;
     player.dashDirY = dy;
     player.dashTimer = PLAYER.dashTime;
-    player.dashCooldown = PLAYER.dashCooldown;
+    player.dashCooldown = PLAYER.dashCooldown * player.dashCdMult;
     world.events.push(EVENT_DASH);
   }
 
@@ -191,8 +276,8 @@ function stepPlayer(world, input, dt) {
     player.vx = player.dashDirX * PLAYER.dashSpeed;
     player.vy = player.dashDirY * PLAYER.dashSpeed;
   } else {
-    player.vx = axis.x * PLAYER.speed;
-    player.vy = axis.y * PLAYER.speed;
+    player.vx = axis.x * PLAYER.speed * player.speedMult;
+    player.vy = axis.y * PLAYER.speed * player.speedMult;
   }
   player.x = Math.max(player.radius, Math.min(FIELD.width - player.radius, player.x + player.vx * dt));
   player.y = Math.max(player.radius, Math.min(FIELD.height - player.radius, player.y + player.vy * dt));
@@ -214,14 +299,17 @@ function stepPlayer(world, input, dt) {
   }
 
   if (input.firing() && player.fireTimer <= 0) {
-    player.fireTimer = PLAYER.fireInterval;
+    player.fireTimer = PLAYER.fireInterval / player.fireRate;
+    player.muzzle = 0.07;
     const shots = player.spreadTimer > 0 ? [-0.22, 0, 0.22] : [0];
     for (const off of shots) {
       const a = player.angle + off;
       const bx = player.x + Math.cos(a) * (player.radius + 8);
       const by = player.y + Math.sin(a) * (player.radius + 8);
-      world.bullets.push(makeBullet(bx, by, Math.cos(a) * PLAYER.bulletSpeed, Math.sin(a) * PLAYER.bulletSpeed, true));
+      world.bullets.push(makeBullet(bx, by, Math.cos(a) * PLAYER.bulletSpeed, Math.sin(a) * PLAYER.bulletSpeed, true, player.damage, player.pierce));
     }
+    // Muzzle flash: a short-lived burst of bright embers at the barrel.
+    burst(world.particles, player.x + Math.cos(player.angle) * (player.radius + 10), player.y + Math.sin(player.angle) * (player.radius + 10), 3, COLORS.bullet, 120, 0.18);
     world.shotsFired += 1;
     world.events.push(EVENT_SHOOT);
   }
@@ -238,6 +326,33 @@ function stepEnemy(world, enemy, dt) {
   if (enemy.kind === 'cinder') {
     enemy.vx = (dx / d) * enemy.speed;
     enemy.vy = (dy / d) * enemy.speed;
+  } else if (enemy.kind === 'dart') {
+    // A dart zigzags as it closes in: hard to lead, easy to kill.
+    enemy.zigPhase += dt * enemy.speed * 0.02;
+    const px = -dy / d;
+    const py = dx / d;
+    const zig = Math.sin(enemy.zigPhase * 3.2) * 0.7;
+    enemy.vx = (dx / d) * enemy.speed + px * zig * enemy.speed * 0.55;
+    enemy.vy = (dy / d) * enemy.speed + py * zig * enemy.speed * 0.55;
+  } else if (enemy.kind === 'sniper') {
+    // A sniper holds its distance and fires aimed shots from afar.
+    const keep = ENEMY.sniper.keepRange;
+    if (d > keep + 60) {
+      enemy.vx = (dx / d) * enemy.speed;
+      enemy.vy = (dy / d) * enemy.speed;
+    } else if (d < keep - 60) {
+      enemy.vx = (-dx / d) * enemy.speed * 0.8;
+      enemy.vy = (-dy / d) * enemy.speed * 0.8;
+    } else {
+      enemy.vx *= 0.9;
+      enemy.vy *= 0.9;
+    }
+    enemy.shootTimer -= dt;
+    if (enemy.shootTimer <= 0 && !player.dead && d < 560) {
+      enemy.shootTimer = ENEMY.sniper.shootInterval * range(world.rng, 0.85, 1.2);
+      const a = Math.atan2(dy, dx);
+      world.bullets.push(makeBullet(enemy.x, enemy.y, Math.cos(a) * ENEMY.sniper.bulletSpeed, Math.sin(a) * ENEMY.sniper.bulletSpeed, false));
+    }
   } else if (enemy.kind === 'spitter') {
     if (d > 300) {
       enemy.vx = (dx / d) * enemy.speed;
@@ -281,22 +396,33 @@ function stepEnemy(world, enemy, dt) {
       enemy.chargeTimer -= dt;
       if (enemy.chargeTimer <= 0) enemy.chargeState = 'roam';
     }
-  } else if (enemy.kind === 'boss') {
+  } else if (enemy.kind === 'boss' || enemy.kind === 'king') {
+    const spec = ENEMY[enemy.kind];
+    const isKing = enemy.kind === 'king';
     enemy.vx = (dx / d) * enemy.speed;
     enemy.vy = (dy / d) * enemy.speed;
     enemy.shootTimer -= dt;
     if (enemy.shootTimer <= 0 && !player.dead) {
-      enemy.shootTimer = ENEMY.boss.shootInterval;
+      enemy.shootTimer = spec.shootInterval;
       const base = Math.atan2(dy, dx);
-      for (let i = 0; i < 8; i += 1) {
-        const a = base + (i / 8) * Math.PI * 2;
-        world.bullets.push(makeBullet(enemy.x, enemy.y, Math.cos(a) * ENEMY.boss.bulletSpeed, Math.sin(a) * ENEMY.boss.bulletSpeed, false));
+      const rays = isKing ? 12 : 8;
+      for (let i = 0; i < rays; i += 1) {
+        const a = base + (i / rays) * Math.PI * 2;
+        world.bullets.push(makeBullet(enemy.x, enemy.y, Math.cos(a) * spec.bulletSpeed, Math.sin(a) * spec.bulletSpeed, false));
+      }
+      if (isKing) {
+        // The King also fires an aimed triple spread at the player.
+        for (const off of [-0.16, 0, 0.16]) {
+          const a = base + off;
+          world.bullets.push(makeBullet(enemy.x, enemy.y, Math.cos(a) * spec.bulletSpeed * 1.25, Math.sin(a) * spec.bulletSpeed * 1.25, false));
+        }
       }
     }
     enemy.summonTimer -= dt;
     if (enemy.summonTimer <= 0) {
-      enemy.summonTimer = ENEMY.boss.summonInterval;
-      for (let i = 0; i < 2; i += 1) {
+      enemy.summonTimer = spec.summonInterval;
+      const count = isKing ? 3 : 2;
+      for (let i = 0; i < count; i += 1) {
         const cinder = makeEnemy('cinder', enemy.x + range(world.rng, -60, 60), enemy.y + range(world.rng, -60, 60), world.rng);
         cinder.speed *= Math.min(1.7, 1 + (world.wave - 1) * 0.035);
         world.enemies.push(cinder);
@@ -321,14 +447,15 @@ function stepBullets(world, dt) {
 
 function stepPickups(world, dt) {
   const player = world.player;
+  const magnet = PICKUP.sparkMagnet * player.magnetMult;
   for (const p of world.pickups) {
     p.life -= dt;
     p.bob += dt * 4;
     if (p.life <= 0) p.dead = true;
     if (player.dead) continue;
     const d = Math.hypot(player.x - p.x, player.y - p.y);
-    if (p.kind === 'spark' && d < PICKUP.sparkMagnet) {
-      const pull = 420 * (1 - d / PICKUP.sparkMagnet);
+    if (p.kind === 'spark' && d < magnet) {
+      const pull = 420 * (1 - d / magnet);
       p.vx += ((player.x - p.x) / (d || 1)) * pull * dt * 4;
       p.vy += ((player.y - p.y) / (d || 1)) * pull * dt * 4;
     }
@@ -370,14 +497,20 @@ function collide(world) {
         if (e.dead) continue;
         const rr = e.radius + b.radius;
         if (dist2(b, e) < rr * rr) {
-          b.dead = true;
           world.shotsHit += 1;
-          e.health -= 1;
+          e.health -= b.damage;
           e.flash = 0.12;
           burst(world.particles, b.x, b.y, 5, COLORS.bullet, 180, 0.3);
+          // Damage numbers: small floating text on every hit, so shots feel like they land.
+          world.texts.push(makeFloatText(b.x, b.y - 10, `-${b.damage}`, COLORS.bullet, true));
           world.events.push(EVENT_HIT);
+          if (b.pierce > 0) {
+            b.pierce -= 1;
+          } else {
+            b.dead = true;
+          }
           if (e.health <= 0) killEnemy(world, e, true);
-          break;
+          if (b.dead) break;
         }
       }
     } else if (!player.dead) {
@@ -412,12 +545,16 @@ function sweep(list) {
 // Advance the world one fixed step. `input` is the live input, or a scripted one for shots.
 export function stepWorld(world, input, dt = STEP) {
   world.events.length = 0;
-  if (world.over) {
+  if (world.over || world.won || world.draftOpen) {
     stepParticles(world, dt);
     return world.events;
   }
   world.time += dt;
   world.bannerTimer = Math.max(0, world.bannerTimer - dt);
+  world.streakTimer = Math.max(0, world.streakTimer - dt);
+  if (world.streakTimer <= 0) world.streakText = '';
+  world.streakClock -= dt;
+  if (world.streakClock <= 0) world.streak = 0;
   world.shake = Math.max(0, world.shake - dt * 26);
   world.hitStop = Math.max(0, world.hitStop - dt);
   if (world.hitStop > 0) return world.events;
@@ -425,7 +562,14 @@ export function stepWorld(world, input, dt = STEP) {
   world.comboTimer -= dt;
   if (world.comboTimer <= 0) world.combo = 0;
 
-  if (world.spawnQueue.length === 0 && world.enemies.length === 0 && !world.over) {
+  if (world.spawnQueue.length === 0 && world.enemies.length === 0 && !world.over && !world.won) {
+    // The wave is clear: offer the draft once per wave (except after the final wave —
+    // there is none), then rest before the next wave.
+    if (world.wave >= 1 && world.wave < FINAL_WAVE && !world.draftOpen && world.draftedWave !== world.wave) {
+      world.draftedWave = world.wave;
+      openDraft(world);
+      return world.events;
+    }
     world.breather -= dt;
     if (world.breather <= 0) {
       world.breather = WAVE.breather;
@@ -441,6 +585,14 @@ export function stepWorld(world, input, dt = STEP) {
       const enemy = makeEnemy(kind, at.x, at.y, world.rng);
       // Later waves are faster: +3.5% speed a wave, capped at +70%.
       enemy.speed *= Math.min(1.7, 1 + (world.wave - 1) * 0.035);
+      // Later waves are tougher: +6% health a wave past wave 5, capped at +60%.
+      const hpMult = Math.min(WAVE.hpCap, 1 + Math.max(0, world.wave - 5) * WAVE.hpPerWave);
+      enemy.health = Math.ceil(enemy.health * hpMult);
+      enemy.maxHealth = enemy.health;
+      // Embered elites from wave 6: double health, double score, gold tint.
+      if (world.wave >= WAVE.eliteFrom && kind !== 'boss' && kind !== 'king' && world.rng() < WAVE.eliteChance) {
+        makeElite(enemy);
+      }
       world.enemies.push(enemy);
     }
   }
