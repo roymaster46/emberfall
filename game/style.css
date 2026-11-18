@@ -1,0 +1,15 @@
+/* Emberfall page chrome: the canvas fills the window on a dark backdrop. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0d0a1a;
+}
+
+#game {
+  display: block;
+  cursor: crosshair;
+  touch-action: none;
+}
